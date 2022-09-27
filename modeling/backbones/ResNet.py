@@ -1,68 +1,67 @@
-# encoding: utf-8
-import math
-
 import torch
-from torch import nn
-from torchvision import models
+import math
+import copy
+import torchvision
+import torch.nn as nn
+from torch.nn import init
+from torch.autograd import Variable
+from torch.nn import functional as F
+
+from .SA import inflate
+from .SA import AP3D
+from .SA import NonLocal
+from .SA import SelfAttn
 
 
-def conv3x3(in_planes, out_planes, stride=1):
-    """3x3 convolution with padding"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
-                     padding=1, bias=False)
+def weights_init_kaiming(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        init.kaiming_normal_(m.weight.data, a=0, mode='fan_out')
+        init.constant_(m.bias.data, 0.0)
+    elif classname.find('Linear') != -1:
+        init.kaiming_normal_(m.weight.data, a=0, mode='fan_out')
+        init.constant_(m.bias.data, 0.0)
+    elif classname.find('BatchNorm') != -1:
+        init.normal_(m.weight.data, 1.0, 0.02)
+        init.constant_(m.bias.data, 0.0)
 
 
-class BasicBlock(nn.Module):
-    expansion = 1
+def weights_init_classifier(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        init.normal_(m.weight.data, std=0.001)
+        init.constant_(m.bias.data, 0.0)      
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
-        super(BasicBlock, self).__init__()
-        self.conv1 = conv3x3(inplanes, planes, stride)
-        self.bn1 = nn.BatchNorm2d(planes)
+
+class Bottleneck3D(nn.Module):
+    def __init__(self, bottleneck2d, block, inflate_time=False, temperature=4, contrastive_att=True):
+        super(Bottleneck3D, self).__init__()
+
+        self.conv1 = inflate.inflate_conv(bottleneck2d.conv1, time_dim=1)
+        self.bn1 = inflate.inflate_batch_norm(bottleneck2d.bn1)
+        if inflate_time == True:
+            self.conv2 = block(bottleneck2d.conv2, temperature=temperature, contrastive_att=contrastive_att)
+        else:
+            self.conv2 = inflate.inflate_conv(bottleneck2d.conv2, time_dim=1)
+        self.bn2 = inflate.inflate_batch_norm(bottleneck2d.bn2)
+        self.conv3 = inflate.inflate_conv(bottleneck2d.conv3, time_dim=1)
+        self.bn3 = inflate.inflate_batch_norm(bottleneck2d.bn3)
         self.relu = nn.ReLU(inplace=True)
-        self.conv2 = conv3x3(planes, planes)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.downsample = downsample
-        self.stride = stride
+
+        if bottleneck2d.downsample is not None:
+            self.downsample = self._inflate_downsample(bottleneck2d.downsample)
+        else:
+            self.downsample = None
+
+    def _inflate_downsample(self, downsample2d, time_stride=1):
+        downsample3d = nn.Sequential(
+            inflate.inflate_conv(downsample2d[0], time_dim=1, 
+                                 time_stride=time_stride),
+            inflate.inflate_batch_norm(downsample2d[1]))
+        return downsample3d
 
     def forward(self, x):
         residual = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-
-        if self.downsample is not None:
-            residual = self.downsample(x)
-
-        out += residual
-        out = self.relu(out)
-
-        return out
-
-
-class Bottleneck(nn.Module):
-    expansion = 4
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
-        super(Bottleneck, self).__init__()
-        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
-                               padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.conv3 = nn.Conv2d(planes, planes * 4, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(planes * 4)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = downsample
-        self.stride = stride
-
-    def forward(self, x):
-        residual = x
-
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
@@ -83,42 +82,63 @@ class Bottleneck(nn.Module):
         return out
 
 
-class ResNet(nn.Module):
-    def __init__(self, last_stride=2, block=Bottleneck, layers=[3, 4, 6, 3]):
-        self.inplanes = 64
-        super().__init__()
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3,
-                               bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.relu = nn.ReLU(inplace=True)   # add missed relu
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.layer1 = self._make_layer(block, 64, layers[0])
-        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
-        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
-        self.layer4 = self._make_layer(
-            block, 512, layers[3], stride=last_stride)
+class ResNet503D(nn.Module):
+    def __init__(self, block, c3d_idx, nl_idx, sa_idx, temperature=4, contrastive_att=True, seq_len=6,**kwargs):
+        super(ResNet503D, self).__init__()
 
-    def _make_layer(self, block, planes, blocks, stride=1):
-        downsample = None
-        if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                nn.Conv2d(self.inplanes, planes * block.expansion,
-                          kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(planes * block.expansion),
-            )
+        self.block = block
+        self.temperature = temperature
+        self.contrastive_att = contrastive_att
+        self.inplanes = 64 
+        self.seq_len = seq_len
 
-        layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample))
-        self.inplanes = planes * block.expansion
-        for i in range(1, blocks):
-            layers.append(block(self.inplanes, planes))
+        resnet2d = torchvision.models.resnet50(pretrained=True)
+        resnet2d.layer4[0].conv2.stride=(1, 1)
+        resnet2d.layer4[0].downsample[0].stride=(1, 1) 
+        
+        ############ STEM ###################
+        self.conv1 = inflate.inflate_conv(resnet2d.conv1, time_dim=1)
+        self.bn1 = inflate.inflate_batch_norm(resnet2d.bn1)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = inflate.inflate_pool(resnet2d.maxpool, time_dim=1)
+        #####################################
 
-        return nn.Sequential(*layers)
+        self.layer1 = self._inflate_reslayer(resnet2d.layer1, c3d_idx=c3d_idx[0], \
+                                             nl_idx=nl_idx[0], sa_idx= sa_idx[0],in_channels=256,ks=[64,32,seq_len])
+        self.layer2 = self._inflate_reslayer(resnet2d.layer2, c3d_idx=c3d_idx[1], \
+                                             nl_idx=nl_idx[1], sa_idx=sa_idx[1],in_channels=512,ks=[32,16,seq_len])
+        self.layer3 = self._inflate_reslayer(resnet2d.layer3, c3d_idx=c3d_idx[2], \
+                                             nl_idx=nl_idx[2], sa_idx=sa_idx[2],in_channels=1024,ks=[16,8,seq_len])
+        self.layer4 = self._inflate_reslayer(resnet2d.layer4, c3d_idx=c3d_idx[3], \
+                                             nl_idx=nl_idx[3], sa_idx=sa_idx[3],in_channels=2048,ks=[16,8,seq_len])
+
+    def _inflate_reslayer(self, reslayer2d, c3d_idx, nl_idx=[], sa_idx=[],in_channels=0,ks=[64,32,1]):
+        reslayers3d = []
+        for i,layer2d in enumerate(reslayer2d):
+            if i not in c3d_idx: # normal 2D convolution
+                layer3d = Bottleneck3D(layer2d, AP3D.C2D, inflate_time=False)
+            else: # (AP)I3D, (AP)P3D-A,B,C
+                layer3d = Bottleneck3D(layer2d, self.block, inflate_time=True, \
+                                       temperature=self.temperature, contrastive_att=self.contrastive_att)
+            reslayers3d.append(layer3d)
+
+            if (i in nl_idx) and (i not in sa_idx):
+                non_local_block = NonLocal.NonLocalBlock3D(in_channels, sub_sample=True)
+                reslayers3d.append(non_local_block)
+            elif (i in sa_idx) and (i not in nl_idx):
+                if ks[0] == 32:
+                    sa_block = SelfAttn.AxialBlock(in_channels,inter_channel=None,kernel_size=ks,granularity=4,groups=8,positional='r_qkv',order='hwt')
+                else:
+                    sa_block = SelfAttn.AxialBlock(in_channels,inter_channel=None,kernel_size=ks,granularity=4,groups=8,positional='r_qkv',order='hwt')
+                reslayers3d.append(sa_block)
+            elif (i in sa_idx) and (i in nl_idx):
+                raise ValueError("can not use nl and sa at the same time!")
+        return nn.Sequential(*reslayers3d)
 
     def forward(self, x):
         x = self.conv1(x)
         x = self.bn1(x)
-        # x = self.relu(x)    # add missed relu
+        x = self.relu(x)
         x = self.maxpool(x)
 
         x = self.layer1(x)
@@ -128,21 +148,45 @@ class ResNet(nn.Module):
 
         return x
 
-    def load_param(self, model_path,autoload=None):
-        if autoload == 'r50':
-            param_dict = models.resnet50(pretrained=True).state_dict()
-        else:
-            param_dict = torch.load(model_path)
-        for i in param_dict:
-            if 'fc' in i:
-                continue
-            self.state_dict()[i].copy_(param_dict[i])
-    def random_init(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-                m.weight.data.normal_(0, math.sqrt(2. / n))
-            elif isinstance(m, nn.BatchNorm2d):
-                m.weight.data.fill_(1)
-                m.bias.data.zero_()
 
+def AP3DResNet50(num_classes, **kwargs):
+    c3d_idx = [[],[0, 2],[0, 2, 4],[]]
+    nl_idx = [[],[],[],[]]
+
+    return ResNet503D(num_classes, AP3D.APP3DC, c3d_idx, nl_idx, **kwargs)
+
+def P3D_ResNet50(**kwargs):
+    c3d_idx = [[],[0,2],[0,2,4],[]]
+    nl_idx = [[],[],[],[]]
+    sa_idx = [[],[],[],[]]
+    return ResNet503D(AP3D.P3DC, c3d_idx, nl_idx, sa_idx, **kwargs)
+
+def P3D_Axial_ResNet50(**kwargs):
+    c3d_idx = [[],[0,1],[0,1,2],[]]
+    nl_idx = [[],[],[],[]]
+    sa_idx = [[],[2,3],[3,4,5],[]]
+    return ResNet503D(AP3D.P3DC, c3d_idx, nl_idx, sa_idx, **kwargs)
+
+def C2D_Axial_ResNet50(**kwargs):
+    c3d_idx = [[],[],[],[]]
+    nl_idx = [[],[],[],[]]
+    sa_idx = [[],[2,3],[3,4,5],[]]
+    return ResNet503D(AP3D.APP3DC, c3d_idx, nl_idx, sa_idx, **kwargs)
+
+
+def C2DResNet50(num_classes, **kwargs):
+    c3d_idx = [[],[],[],[]]
+    nl_idx = [[],[],[],[]]
+    return ResNet503D(num_classes, AP3D.APP3DC, c3d_idx, nl_idx, sa_idx, **kwargs)
+
+def C2DNLResNet50(num_classes, **kwargs):
+    c3d_idx = [[],[],[],[]]
+    nl_idx = [[],[2, 3],[3, 4, 5],[]]
+
+    return ResNet503D(num_classes, AP3D.APP3DC, c3d_idx, nl_idx, **kwargs)
+
+def AP3DNLResNet50(num_classes, **kwargs):
+    c3d_idx = [[],[0, 2],[0, 2, 4],[]]
+    nl_idx = [[],[1, 3],[1, 3, 5],[]]
+
+    return ResNet503D(num_classes, AP3D.APP3DC, c3d_idx, nl_idx, **kwargs)
