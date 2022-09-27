@@ -3,6 +3,12 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+import sys
+import os
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.dirname(SCRIPT_DIR))
+
 from modeling.backbones.resnet import ResNet, BasicBlock, Bottleneck
 from modeling.backbones.resnet_NL import ResNet_NL
 from modeling.backbones.ResNet import C2D_Axial_ResNet50
