@@ -3,9 +3,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from modeling.backbones.ResNet import ResNet, BasicBlock, Bottleneck
-from modeling.backbones.resnet_NL import ResNet_NL
-from modeling.backbones.ResNet import C2D_Axial_ResNet50
+from backbones.ResNet import ResNet, BasicBlock, Bottleneck
+from backbones.resnet_NL import ResNet_NL
+from backbones.ResNet import C2D_Axial_ResNet50
 
 
 def weights_init_kaiming(m):
