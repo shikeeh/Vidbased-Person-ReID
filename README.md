@@ -3,6 +3,7 @@ Selection and implementation of a video-based person re-identification algorithm
 
 ## 1. Introduction
 Because this is a newer concept to me, I will attempt to clearly define this project. I must also admit that this is my first time diving so deeply into this specific area of computer vision, and while the task is very exciting to me, there are many areas that I lack understanding and knowledge in. I wish I had more than 24 hours to discover and understand everything there is that makes this field of computer vision tick.
+The task given to me was to implement a video-based person re-identification algorithm on a single camera as part of a hiring assessment. I was allowed to implement models already built instead of having to build my own.
 - Person re-identification (reID) aims to retrieve person videos with the same identity as a query person across non-overlapping cameras (simply find, but the task is not so straightforward for a machine)
 - This project will focus on the video-based setting as compared to an image-based setting that identifies people with still images. Thus it aims at matching the video tracklets with cropped video frames for identifying the pedestrians under different cameras. Possible reasons include
     - Video sequences are more practical for real-world scenarios, and
